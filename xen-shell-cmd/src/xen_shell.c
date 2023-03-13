@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include <mem-mgmt.h>
 #include "domain.h"
 #include "xenstore_srv.h"
 #include <xen_shell.h>
@@ -89,15 +90,34 @@ void evtchn_callback(void *priv)
 	k_sem_give(&domain->console_sem);
 }
 
-int init_domain_console(struct xen_domain *domain)
+/*
+ * Initialize domain console by setting HVM param for domain
+ * and event channel binding in dom0.
+ *
+ * @param domain - domain, where console should be initialized
+ *
+ * @return - zero on success, negative errno on failure
+ */
+static int init_domain_console(struct xen_domain *domain)
 {
-	int rc = 0;
+	int rc = 0, err_ret;
+
+	rc = xenmem_map_region(domain->domid, 1,
+			       XEN_PHYS_PFN(GUEST_MAGIC_BASE) +
+			       CONSOLE_PFN_OFFSET,
+			       (void **)&domain->intf);
+	if (rc < 0) {
+		LOG_ERR("Failed to map console ring for domain#%u (rc=%d)",
+			domain->domid, rc);
+		return rc;
+	}
 
 	rc = bind_interdomain_event_channel(domain->domid, domain->console_evtchn,
-					       evtchn_callback, domain);
-
-	if (rc < 0)
-		return rc;
+					    evtchn_callback, domain);
+	if (rc < 0) {
+		LOG_ERR("Failed to bind interdomain event channel (rc=%d)", rc);
+		goto unmap_ring;
+	}
 
 	domain->local_console_evtchn = rc;
 
@@ -110,14 +130,23 @@ int init_domain_console(struct xen_domain *domain)
 
 	if (rc) {
 		LOG_ERR("Failed to set domain console evtchn param (rc=%d)", rc);
-		return rc;
+		goto unmap_ring;
 	}
 
+	return rc;
+
+unmap_ring:
+	err_ret = xenmem_unmap_region(1, domain->intf);
+	if (err_ret < 0) {
+		LOG_ERR("Failed to unmap domain#%u console ring (rc=%d)",
+			domain->domid, err_ret);
+	}
 	return rc;
 }
 
 int start_domain_console(struct xen_domain *domain)
 {
+	int rc;
 	size_t slot = 0;
 
 	if (domain->console_tid) {
@@ -130,6 +159,12 @@ int start_domain_console(struct xen_domain *domain)
 	if (slot >= DOM_MAX) {
 		LOG_ERR("Unable to find memory for console stack (%zu >= MAX:%d)", slot, DOM_MAX);
 		return 1;
+	}
+
+	rc = init_domain_console(domain);
+	if (rc) {
+		LOG_ERR("Unable to init domain#%u console (rc=%d)", domain->domid, rc);
+		return rc;
 	}
 
 	stack_slots[slot] = domain->domid;
@@ -168,11 +203,16 @@ int stop_domain_console(struct xen_domain *domain)
 	unbind_event_channel(domain->local_console_evtchn);
 	rc = evtchn_close(domain->local_console_evtchn);
 
-	if (rc)
-	{
+	if (rc) {
 		LOG_ERR("Unable to close event channel#%u", domain->local_console_evtchn);
 		return rc;
 	}
 
-	return 0;
+	rc = xenmem_unmap_region(1, domain->intf);
+	if (rc < 0) {
+		LOG_ERR("Failed to unmap domain#%u console ring (rc=%d)",
+			domain->domid, rc);
+	}
+
+	return rc;
 }
