@@ -77,7 +77,7 @@ int domu_console_start(const struct shell *shell, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	return domain_console_stop(domid);
+	return domain_console_start(domid);
 }
 
 int domu_console_stop(const struct shell *shell, size_t argc, char **argv)
