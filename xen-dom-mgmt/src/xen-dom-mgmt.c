@@ -807,13 +807,23 @@ int domain_destroy(uint32_t domid)
 		return -EINVAL;
 	}
 
-	stop_domain_stored(domain);
-	/* TODO: do this on console destroying */
-	stop_domain_console(domain);
+	rc = stop_domain_stored(domain);
+	if (rc) {
+		LOG_ERR("Failed to stop domain#%u store (rc=%d)", domain->domid, rc);
+		return rc;
+	}
 
+	rc = stop_domain_console(domain);
+	if (rc) {
+		LOG_ERR("Failed to stop domain#%u console (rc=%d)", domain->domid, rc);
+		return rc;
+	}
 
 	rc = xen_domctl_destroydomain(domid);
-	LOG_DBG("Return code = %d XEN_DOMCTL_destroydomain", rc);
+	if (rc) {
+		LOG_ERR("Failed to destroy domain#%u (rc=%d)", domain->domid, rc);
+		return rc;
+	}
 
 	k_mutex_lock(&dl_mutex, K_FOREVER);
 	sys_dlist_remove(&domain->node);
