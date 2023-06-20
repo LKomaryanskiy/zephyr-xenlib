@@ -140,6 +140,7 @@ static uint64_t glob_gen_inc_ret(void)
 
 	k_mutex_lock(&gen_mutex, K_FOREVER);
 	ret = ++global_generation;
+	LOG_ERR("%s %d global generation return = %llu", __func__, __LINE__, ret);
 	k_mutex_unlock(&gen_mutex);
 
 	return ret;
@@ -878,6 +879,7 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
 			iter->key[namelen] = 0;
 			iter->value = NULL;
 			iter->generation = glob_gen_inc_ret();
+			LOG_ERR("%s %d create node gen = %llu", __func__, __LINE__, iter->generation);
 			sys_slist_init(&iter->perms);
 
 			sys_dlist_init(&iter->child_list);
@@ -921,6 +923,7 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
 			 * node generation if we change existing node.
 			 */
 			iter->generation = glob_gen_inc_ret();
+			LOG_ERR("%s %d update node gen = %llu", __func__, __LINE__, iter->generation);
 			k_free(iter->value);
 		}
 
@@ -1121,6 +1124,7 @@ int xss_set_perm(const char *path, domid_t domid, enum xs_perm perm)
 	rc = set_perms_by_array(entry, &permissions, 1);
 	if (!rc) {
 		entry->generation = glob_gen_inc_ret();
+		LOG_ERR("%s %d set perm gen = %llu", __func__, __LINE__, entry->generation);
 	}
 
 	k_mutex_unlock(&xsel_mutex);
@@ -1371,6 +1375,7 @@ static void handle_set_perms(struct xenstore *xenstore, struct xsd_sockmsg *head
 		return;
 	}
 	entry->generation = glob_gen_inc_ret();
+	LOG_ERR("%s %d set perm gen = %llu", __func__, __LINE__, entry->generation);
 	k_mutex_unlock(&xsel_mutex);
 
 	send_reply(xenstore, header->req_id, XS_SET_PERMS, "OK");
