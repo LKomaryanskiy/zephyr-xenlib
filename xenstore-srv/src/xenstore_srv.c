@@ -52,6 +52,7 @@ struct xs_entry {
 	sys_dlist_t child_list;
 
 	sys_dnode_t node;
+	uint64_t generation;
 };
 
 struct watch_entry {
@@ -74,6 +75,8 @@ static K_THREAD_STACK_ARRAY_DEFINE(xenstore_thrd_stack,
 				   CONFIG_DOM_MAX,
 				   XENSTORE_STACK_SIZE_PER_DOM);
 
+static K_MUTEX_DEFINE(gen_mutex);
+static uint64_t global_generation;
 static uint32_t used_threads;
 static K_MUTEX_DEFINE(xs_stack_lock);
 BUILD_ASSERT(sizeof(used_threads) * CHAR_BIT >= CONFIG_DOM_MAX);
@@ -129,6 +132,17 @@ static void free_stack_idx(int idx)
 	used_threads &= ~BIT(idx);
 
 	k_mutex_unlock(&xs_stack_lock);
+}
+
+static uint64_t glob_gen_inc_ret(void)
+{
+	uint64_t ret;
+
+	k_mutex_lock(&gen_mutex, K_FOREVER);
+	ret = ++global_generation;
+	k_mutex_unlock(&gen_mutex);
+
+	return ret;
 }
 
 /*
@@ -863,6 +877,7 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
 			memcpy(iter->key, tok, namelen);
 			iter->key[namelen] = 0;
 			iter->value = NULL;
+			iter->generation = glob_gen_inc_ret();
 			sys_slist_init(&iter->perms);
 
 			sys_dlist_init(&iter->child_list);
@@ -901,6 +916,11 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
 		}
 
 		if (iter->value) {
+			/*
+			 * Increase global generation counter and update
+			 * node generation if we change existing node.
+			 */
+			iter->generation = glob_gen_inc_ret();
 			k_free(iter->value);
 		}
 
@@ -1099,6 +1119,10 @@ int xss_set_perm(const char *path, domid_t domid, enum xs_perm perm)
 	}
 
 	rc = set_perms_by_array(entry, &permissions, 1);
+	if (!rc) {
+		entry->generation = glob_gen_inc_ret();
+	}
+
 	k_mutex_unlock(&xsel_mutex);
 
 	return rc;
@@ -1341,11 +1365,13 @@ static void handle_set_perms(struct xenstore *xenstore, struct xsd_sockmsg *head
 	}
 
 	rc = set_perms_by_strings(entry, perm_string, perms_str_size);
-	k_mutex_unlock(&xsel_mutex);
 	if (rc) {
+		k_mutex_unlock(&xsel_mutex);
 		send_errno(xenstore, header->req_id, rc);
 		return;
 	}
+	entry->generation = glob_gen_inc_ret();
+	k_mutex_unlock(&xsel_mutex);
 
 	send_reply(xenstore, header->req_id, XS_SET_PERMS, "OK");
 }
