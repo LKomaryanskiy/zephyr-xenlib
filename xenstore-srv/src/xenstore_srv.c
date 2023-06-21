@@ -39,6 +39,10 @@ LOG_MODULE_REGISTER(xenstore);
 #define INIT_XENSTORE_BUFF_SIZE 80
 #define INIT_XENSTORE_UUID_BUF_SIZE 40
 
+/* Maximum number of transactions, available for each domain. Can be changed by Dom0 */
+static size_t quota_max_trans = 10;
+//static size_t quita_max_trans_nodes = 200;
+
 struct xs_permissions {
 	sys_snode_t node;
 	enum xs_perm perms;
@@ -48,11 +52,37 @@ struct xs_permissions {
 struct xs_entry {
 	char *key;
 	char *value;
+	char *full_path;
 	sys_slist_t perms;
 	sys_dlist_t child_list;
 
 	sys_dnode_t node;
 	uint64_t generation;
+};
+
+struct xs_trans_accessed_node {
+	/* Used to connect list of accessed nodes */
+	sys_snode_t node;
+	/*
+	 * Temporary node value that will be used during transaction. At the end of
+	 * transaction, the value will be fetched to the real entry.
+	 */
+	struct xs_entry *trans_entry;
+	/* If entry was modified in the current transaction or in the real tree */
+	bool is_modified;
+	/* If entry does not exist in the real tree and should be created at the end of transaction */
+	bool should_create;
+	/* If entry exists in the real tree and should be deleted at the end of transaction */
+	bool should_delete;
+};
+
+struct xs_transaction {
+	sys_snode_t node;
+	struct xenstore *xenstore;
+	uint32_t tx_id;
+	sys_slist_t acc_nodes;
+	uint64_t generation;
+	bool failed;
 };
 
 struct watch_entry {
@@ -142,7 +172,6 @@ static uint64_t glob_gen_inc_ret(void)
 
 	k_mutex_lock(&gen_mutex, K_FOREVER);
 	ret = ++global_generation;
-	LOG_ERR("%s %d global generation return = %llu", __func__, __LINE__, ret);
 	k_mutex_unlock(&gen_mutex);
 
 	return ret;
@@ -323,6 +352,294 @@ static struct xs_entry *key_to_entry_check_perm(const char *key, uint32_t domid,
 	}
 
 	return NULL;
+}
+
+static struct xs_transaction *find_transaction(struct xenstore *xenstore, uint32_t tx_id)
+{
+	struct xs_transaction *iter;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&xenstore->transactions, iter, node) {
+		if (iter->tx_id == tx_id) {
+			return iter;
+		}
+	}
+
+	return NULL;
+}
+
+static struct xs_trans_accessed_node *find_accessed_node(struct xs_transaction *trans, const char *path)
+{
+	struct xs_trans_accessed_node *iter;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&trans->acc_nodes, iter, node) {
+		if (!strcmp(path, iter->trans_entry->full_path)) {
+			return iter;
+		}
+	}
+
+	return NULL;
+}
+
+static struct xs_trans_accessed_node *get_acc_node(struct xenstore *xenstore, uint32_t tx_id, const char *path)
+{
+	struct xs_trans_accessed_node *acc_node;
+	struct xs_transaction *trans;
+
+	trans = find_transaction(xenstore, tx_id);
+	if (!trans) {
+		return NULL;
+	}
+
+	acc_node = find_accessed_node(trans, path);
+	if (!acc_node) {
+		return NULL;
+	}
+
+	return acc_node;
+}
+
+enum trans_action {
+	XS_TRANS_READ,
+	XS_TRANS_WRITE,
+	XS_TRANS_DELETE,
+	XS_TRANS_CREATE
+};
+
+static int copy_perms(struct xs_entry *dst, struct xs_entry *src)
+{
+	struct xs_permissions *perms, *iter;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&src->perms, iter, node) {
+		perms = k_malloc(sizeof(*perms));
+		if (!perms) {
+			goto alloc_err;
+		}
+		perms->domid = iter->domid;
+		perms->perms = iter->perms;
+		sys_slist_append(&dst->perms, &perms->node);
+	}
+
+	return 0;
+
+alloc_err:
+	//free_perms(&dst->perms);
+	return -ENOMEM;
+}
+
+static int copy_node_data(struct xs_entry *dst, struct xs_entry *src)
+{
+	size_t val_size;
+
+	memset(dst,0, sizeof(*dst));
+
+	dst->generation = src->generation;
+	if (src->value) {
+		val_size = str_byte_size(src->value);
+		dst->value = k_malloc(val_size);
+		if (!dst->value) {
+			//handle properly
+			return -ENOMEM;
+		}
+		memcpy(dst->value, src->value, val_size);
+	} else {
+		dst->value = NULL;
+	}
+
+	dst->full_path = k_malloc(str_byte_size(src->full_path));
+	if (!dst->full_path) {
+		return -1;
+	}
+	memcpy(dst->full_path, src->full_path, str_byte_size(src->full_path));
+
+	sys_slist_init(&dst->perms);
+	sys_dlist_init(&dst->child_list);
+	sys_dnode_init(&dst->node);
+
+	return copy_perms(dst, src);
+}
+
+static struct xs_trans_accessed_node *new_acc_node(struct xs_transaction *trans, struct xs_entry *entry, enum trans_action act)
+{
+	struct xs_trans_accessed_node *acc_node;
+
+	acc_node = k_malloc(sizeof(*acc_node));
+	if (!acc_node) {
+		return NULL;
+	}
+
+	memset(acc_node, 0, sizeof(*acc_node));
+
+	switch (act) {
+	case XS_TRANS_DELETE:
+		acc_node->should_delete = true;
+		break;
+	case XS_TRANS_CREATE:
+		acc_node->should_create = true;
+		break;
+	default:
+		break;
+	}
+	acc_node->is_modified = true;
+
+	if (act == XS_TRANS_DELETE) {
+		acc_node->trans_entry = NULL;
+		return acc_node;
+	}
+
+	acc_node->trans_entry = k_malloc(sizeof(*acc_node->trans_entry));
+	if (!acc_node->trans_entry) {
+		//Handle properly
+		return NULL;
+	}
+
+	if (copy_node_data(acc_node->trans_entry, entry)) {
+		//Handle properly
+		return NULL;
+	}
+
+	acc_node->trans_entry->generation = trans->generation;
+
+	return acc_node;
+
+}
+
+static bool has_active_transactions(void)
+{
+	struct xenstore *iter;
+	bool active_trans = false;
+
+	k_mutex_lock(&xenstore_list_mutex, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&xenstores_list, iter, node) {
+		if (iter->active_transactions) {
+			active_trans = true;
+			break;
+		}
+	}
+	k_mutex_unlock(&xenstore_list_mutex);
+
+	return active_trans;
+}
+
+static int modify_existing_acc_node(struct xs_transaction *trans, struct xs_trans_accessed_node *acc_node, struct xs_entry *entry, enum trans_action act)
+{
+	switch (act) {
+	case XS_TRANS_DELETE:
+		acc_node->should_delete = true;
+		break;
+	case XS_TRANS_CREATE:
+		acc_node->should_create = true;
+		break;
+	default:
+		break;
+	}
+
+	acc_node->is_modified = true;
+	if (act != XS_TRANS_DELETE) {
+		k_free(acc_node->trans_entry->value);
+		copy_node_data(acc_node->trans_entry, entry);
+	}
+	acc_node->trans_entry->generation = trans->generation;
+
+	return 0;
+}
+
+static int save_node_to_all_active_transaction(struct xenstore *xenstore,
+					       struct xs_entry *entry,
+					       enum trans_action act)
+{
+	struct xs_transaction *trans_iter;
+	struct xs_trans_accessed_node *acc_node;
+	struct xenstore *xenstore_iter;
+
+	k_mutex_lock(&xenstore_list_mutex, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&xenstores_list, xenstore_iter, node) {
+		// May be accessed from multiple threads, add locking
+		if (!xenstore_iter->active_transactions) {
+			continue;
+		}
+		SYS_SLIST_FOR_EACH_CONTAINER(&xenstore_iter->transactions, trans_iter, node) {
+			/* Check if transaction already has the copy of node */
+			acc_node = find_accessed_node(trans_iter, entry->full_path);
+			if (acc_node) {
+				continue;
+			}
+			acc_node = new_acc_node(trans_iter, entry, act);
+			if (!acc_node) {
+				// Handle properly 
+				trans_iter->failed = true;
+			} else {
+				sys_slist_append(&trans_iter->acc_nodes, &acc_node->node);
+			}
+		}
+	}
+	k_mutex_unlock(&xenstore_list_mutex);
+
+	return 0;
+}
+
+static bool is_trans_call(struct xenstore *xenstore, uint32_t tx_id)
+{
+	return tx_id && xenstore && find_transaction(xenstore, tx_id);
+}
+
+static int trans_update_node(struct xenstore *xenstore, struct xs_entry *entry, uint32_t tx_id, enum trans_action act)
+{
+	struct xs_trans_accessed_node *acc_node;
+	struct xs_transaction *trans;
+
+	/* There are no active transactions, so we do no need to commit any access to nodes */
+	if (!has_active_transactions()) {
+		return 0;
+	}
+
+	/*
+	 * Out of transaction action that modifies xenstore tree directly.
+	 * In this case, we should save old node values to all active transactions.
+	 */
+	if (!tx_id) {
+		return save_node_to_all_active_transaction(xenstore, entry, act);
+	}
+
+	trans = find_transaction(xenstore, tx_id);
+	if (!trans) {
+		return -EINVAL;
+	}
+
+	acc_node = find_accessed_node(trans, entry->full_path);
+	if (acc_node) {
+		/* Modify existing access node */
+		return modify_existing_acc_node(trans, acc_node, entry, act);
+	} else {
+		/* Create access node */
+		acc_node = new_acc_node(trans, entry, act);
+		if (!acc_node) {
+			trans->failed = true;
+			return -ENOMEM;
+		} else {
+			sys_slist_append(&trans->acc_nodes, &acc_node->node);
+		}
+	}
+
+	return 0;
+}
+
+static int trans_modify_node_with_children(struct xenstore *xenstore, const char *path, uint32_t tx_id, enum trans_action act)
+{
+	struct xs_transaction *trans;
+	struct xs_trans_accessed_node *iter;
+
+	trans = find_transaction(xenstore, tx_id);
+	if (!trans) {
+		return -EINVAL;
+	}
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&trans->acc_nodes, iter, node) {
+		if (!strncmp(path, iter->trans_entry->full_path, strlen(path))) {
+			modify_existing_acc_node(trans, iter, NULL, act);
+		}
+	}
+
+	return 0;
 }
 
 static bool check_indexes(XENSTORE_RING_IDX cons, XENSTORE_RING_IDX prod)
@@ -653,18 +970,13 @@ static void remove_recurse(sys_dlist_t *children)
  */
 static void free_node(struct xs_entry *entry)
 {
-	if (entry->key) {
-		k_free(entry->key);
-		entry->key = NULL;
-	}
-
-	if (entry->value) {
-		k_free(entry->value);
-		entry->value = NULL;
-	}
-
+	k_free(entry->key);
+	k_free(entry->value);
+	k_free(entry->full_path);
 	free_perms(&entry->perms);
-	sys_dlist_remove(&entry->node);
+	if (sys_dnode_is_linked(&entry->node)) {
+		sys_dlist_remove(&entry->node);
+	}
 	remove_recurse(&entry->child_list);
 	k_free(entry);
 }
@@ -827,87 +1139,230 @@ ret_err:
 	return -ENOMEM;
 }
 
-static int xss_do_write(const char *const_path, const char *data, uint32_t domid,
-			struct xs_permissions *perms, size_t perms_num)
+static struct xs_entry *get_closest_ancestor(const char *const_path, const char **rest_path)
 {
-	int rc = 0;
-	struct xs_entry *iter = NULL, *insert_entry = NULL, *parent_entry = NULL;
-	char *path;
-	char *tok, *tok_state, *new_value;
-	size_t data_len = str_byte_size(data);
-	size_t namelen;
-	sys_dlist_t *inspected_list;
+	struct xs_entry *iter = NULL, *ancestor = NULL;
+	char *tok;
+	sys_dlist_t *inspected_list = &root_xenstore.child_list;
+	bool is_found;
 
-	path = k_malloc(str_byte_size(const_path));
-	if (!path) {
-		LOG_ERR("Failed to allocate memory for path\n");
-		return -ENOMEM;
-	}
+	*rest_path = const_path;
 
-	strcpy(path, const_path);
-	k_mutex_lock(&xsel_mutex, K_FOREVER);
-	inspected_list = &root_xenstore.child_list;
-
-	for (tok = strtok_r(path, "/", &tok_state); tok != NULL; tok = strtok_r(NULL, "/", &tok_state)) {
+	while ((tok = strchr(*rest_path, '/')) != NULL) {
+		is_found = false;
+		*rest_path = tok + 1;
 		SYS_DLIST_FOR_EACH_CONTAINER(inspected_list, iter, node) {
-			parent_entry = iter;
-			if (strcmp(iter->key, tok) == 0) {
+			if (strncmp(iter->key, *rest_path, strlen(iter->key)) == 0) {
+				is_found = true;
 				break;
 			}
 		}
-
-		if (iter == NULL) {
-			if (parent_entry && !check_perms(parent_entry, XS_PERM_WRITE, domid)) {
-				LOG_INF("Permission denied for domid#%u (%s)", domid, path);
-				rc = -EACCES;
-				goto free_allocated;
-			}
-
-			iter = k_malloc(sizeof(*iter));
-			if (!iter) {
-				LOG_ERR("Failed to allocate memory for xs entry");
-				rc = -ENOMEM;
-				goto free_allocated;
-			}
-
-			namelen = strlen(tok);
-			iter->key = k_malloc(namelen + 1);
-			if (!iter->key) {
-				k_free(iter);
-				rc = -ENOMEM;
-				goto free_allocated;
-			}
-			memcpy(iter->key, tok, namelen);
-			iter->key[namelen] = 0;
-			iter->value = NULL;
-			iter->generation = glob_gen_inc_ret();
-			LOG_ERR("%s %d create node gen = %llu", __func__, __LINE__, iter->generation);
-			sys_slist_init(&iter->perms);
-
-			sys_dlist_init(&iter->child_list);
-			sys_dnode_init(&iter->node);
-			sys_dlist_append(inspected_list, &iter->node);
-			if (perms && perms_num) {
-				rc = set_perms_by_array(iter, perms, perms_num);
-			} else {
-				rc = inherit_perms(iter, parent_entry, domid);
-			}
-			if (rc) {
-				LOG_ERR("Failed to set permissions (rc=%d)", rc);
-				goto free_allocated;
-			}
-
-			if (!insert_entry) {
-				insert_entry = iter;
-			}
+		if (!is_found) {
+			break;
 		}
-
+		ancestor = iter;
 		inspected_list = &iter->child_list;
 	}
+	*rest_path = tok;
 
-	if (iter && data_len > 0) {
-		if (!check_perms(iter, XS_PERM_WRITE, domid)) {
-			LOG_INF("Permission denied for domid#%u (%s)", domid, path);
+	return ancestor;
+}
+
+static struct xs_entry *construct_xs_entry(char *key, struct xs_entry *parent_entry, uint32_t domid,
+				     struct xs_permissions *perms, size_t perms_num)
+{
+	struct xs_entry *new_entry;
+	size_t key_len, fullpath_len;
+
+	new_entry = k_malloc(sizeof(*new_entry));
+	if (!new_entry) {
+		LOG_ERR("Failed to allocate memory for new xs entry");
+		return NULL;
+	}
+	memset(new_entry, 0, sizeof(*new_entry));
+
+	key_len = str_byte_size(key);
+	new_entry->key = key;
+
+	if (parent_entry) {
+		fullpath_len = key_len + str_byte_size(parent_entry->full_path) + 1;
+	} else {
+		fullpath_len = key_len + 1;
+	}
+	new_entry->full_path = k_malloc(fullpath_len);
+	if (!new_entry->full_path) {
+		LOG_ERR("Failed to allocate memory for new xs entry full path");
+		goto free_entry;
+	}
+
+	snprintf(new_entry->key, key_len, "%s", key);
+	if (parent_entry) {
+		snprintf(new_entry->full_path, fullpath_len, "%s/%s",
+			 parent_entry->full_path, key);
+	} else {
+		snprintf(new_entry->full_path, fullpath_len, "/%s", key);
+	}
+
+	sys_slist_init(&new_entry->perms);
+	sys_dlist_init(&new_entry->child_list);
+	sys_dnode_init(&new_entry->node);
+
+	if (perms && perms_num) {
+		if (set_perms_by_array(new_entry, perms, perms_num)) {
+			goto free_fullpath;
+		}
+	} else {
+		if (inherit_perms(new_entry, parent_entry, domid)) {
+			goto free_fullpath;
+		}
+	}
+
+	return new_entry;
+
+free_fullpath:
+	k_free(new_entry->full_path);
+free_entry:
+	k_free(new_entry);
+	return NULL;
+}
+
+static int xss_create_nodes(struct xs_entry **head_entry, struct xs_entry **write_entry,
+			    struct xs_entry *parent_entry, const char *path, uint32_t domid,
+			    struct xs_permissions *perms, size_t perms_num)
+{
+	int rc = 0;
+	struct xs_entry *new_entry = NULL;
+	char *tok, *key_end, *key_buf;
+	const char *rest_path = path;
+	sys_dlist_t *inspected_list = NULL;
+	size_t key_len;
+
+	*head_entry = NULL;
+	*write_entry = NULL;
+
+	while ((tok = strchr(rest_path, '/')) != NULL) {
+		rest_path = tok + 1;
+		key_end = strchr(rest_path, '/');
+		if (key_end) {
+			key_len = key_end - rest_path;
+		} else {
+			key_len = &path[strlen(path)] - rest_path;
+		}
+
+		key_buf = k_malloc(key_len + 1);
+		if (!key_buf) {
+			rc = -ENOMEM;
+			goto free_allocated;
+		}
+		snprintf(key_buf, key_len + 1, "%s", rest_path);
+
+		new_entry = construct_xs_entry(key_buf, parent_entry, domid, perms, perms_num);
+		if (!new_entry) {
+			k_free(key_buf);
+			rc = -ENOMEM;
+			goto free_allocated;
+		}
+
+		new_entry->generation = glob_gen_inc_ret();
+		if (inspected_list) {
+			sys_dlist_append(inspected_list, &new_entry->node);
+		}
+
+		if (!(*head_entry)) {
+			*head_entry = new_entry;
+		}
+
+		inspected_list = &new_entry->child_list;
+		parent_entry = new_entry;
+	}
+
+	*write_entry = new_entry;
+
+	return rc;
+
+free_allocated:
+	if (*head_entry) {
+		free_node(*head_entry);
+	}
+
+	return rc;
+}
+
+static void trans_update_nodes(struct xenstore *xenstore, struct xs_entry *entry, uint32_t tx_id);
+
+static void trans_update_nodes_recourse(struct xenstore *xenstore, uint32_t tx_id, sys_dlist_t *children)
+{
+	struct xs_entry *entry;
+
+	SYS_DLIST_FOR_EACH_CONTAINER(children, entry, node) {
+		trans_update_nodes(xenstore, entry, tx_id);
+	}
+}
+
+static void trans_update_nodes(struct xenstore *xenstore, struct xs_entry *entry, uint32_t tx_id)
+{
+	trans_update_node(xenstore, entry, tx_id, XS_TRANS_WRITE);
+	trans_update_nodes_recourse(xenstore, tx_id, &entry->child_list);
+}
+
+static int xss_do_write(struct xenstore *xenstore, uint32_t tx_id,
+			const char *const_path, const char *data, uint32_t domid,
+			struct xs_permissions *perms, size_t perms_num)
+{
+	int rc = 0;
+	struct xs_entry *insert_entry = NULL, *write_entry, *ancestor, *trans_entry;
+	char *new_value;
+	const char *children_path;
+	bool is_transaction = is_trans_call(xenstore, tx_id);
+	size_t data_len = str_byte_size(data);
+
+	k_mutex_lock(&xsel_mutex, K_FOREVER);
+	write_entry = key_to_entry(const_path);
+	if (!write_entry) {
+		ancestor = get_closest_ancestor(const_path, &children_path);
+		rc = xss_create_nodes(&insert_entry, &write_entry, ancestor, children_path, domid, perms, perms_num);
+		if (rc) {
+			goto free_allocated;
+		}
+
+		/* Update real tree */
+		if (!is_transaction) {
+			/* If ancestor is NULL, that means we have to add entry to the root node */
+			if (!ancestor) {
+				if (domid == 0) {
+					sys_dlist_append(&root_xenstore.child_list, &insert_entry->node);
+				} else {
+					rc = -EACCES;
+					goto free_allocated;
+				}
+			} else {
+				if (check_perms(ancestor, XS_WRITE, domid)) {
+					sys_dlist_append(&ancestor->child_list, &insert_entry->node);
+				} else {
+					rc = -EACCES;
+					goto free_allocated;
+				}
+			}
+		}
+	}
+
+	/*
+	 * Save old value if this is out of transaction action.
+	 * In this case we can ignore return value because in case
+	 * of any error, transaction will be marked as failed but
+	 * we still can write to the real tree.
+	 */
+	if (!is_transaction) {
+		if (insert_entry) {
+			trans_update_nodes(xenstore, insert_entry, tx_id);
+		} else {
+			trans_update_node(xenstore, write_entry, tx_id, XS_TRANS_WRITE);
+		}
+	}
+
+	if (data_len > 0) {
+		if (!check_perms(write_entry, XS_PERM_WRITE, domid)) {
+			LOG_INF("Permission denied for domid#%u (%s)", domid, const_path);
 			rc = -EACCES;
 			goto free_allocated;
 		}
@@ -919,32 +1374,50 @@ static int xss_do_write(const char *const_path, const char *data, uint32_t domid
 			goto free_allocated;
 		}
 
-		if (iter->value) {
+		if (is_transaction) {
+			trans_entry = k_malloc(sizeof(*trans_entry));
+			if (!trans_entry) {
+				//Handle properly
+				return 0;
+			}
+
+			if (copy_node_data(trans_entry, write_entry)) {
+				//Handle properly
+				return 0;
+			}
+			write_entry = trans_entry;
+		}
+
+		if (write_entry->value) {
 			/*
 			 * Increase global generation counter and update
 			 * node generation if we change existing node.
 			 */
-			iter->generation = glob_gen_inc_ret();
-			LOG_ERR("%s %d update node gen = %llu", __func__, __LINE__, iter->generation);
-			k_free(iter->value);
+			if (!is_transaction) {
+				write_entry->generation = glob_gen_inc_ret();
+			}
+			k_free(write_entry->value);
 		}
 
-		iter->value = new_value;
-		memcpy(iter->value, data, data_len);
+		write_entry->value = new_value;
+		memcpy(write_entry->value, data, data_len);
+	}
+
+	if (is_transaction) {
+		if (insert_entry) {
+			trans_update_nodes(xenstore, insert_entry, tx_id);
+		} else {
+			trans_update_node(xenstore, write_entry, tx_id, XS_TRANS_WRITE);
+		}
 	}
 
 	k_mutex_unlock(&xsel_mutex);
-	k_free(path);
 
 	return rc;
 
 free_allocated:
-	if (insert_entry) {
-		free_node(insert_entry);
-	}
-
+	free_node(insert_entry);
 	k_mutex_unlock(&xsel_mutex);
-	k_free(path);
 
 	return rc;
 }
@@ -1009,7 +1482,7 @@ int xss_write(const char *path, const char *value)
 		return -EINVAL;
 	}
 
-	rc = xss_do_write(path, value, 0, &perms, 1);
+	rc = xss_do_write(NULL, 0, path, value, 0, &perms, 1);
 	if (rc) {
 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
 	} else {
@@ -1032,7 +1505,7 @@ int xss_write_guest_domain_rw(const char *path, const char *value, uint32_t domi
 		return -EINVAL;
 	}
 
-	rc = xss_do_write(path, value, 0, &perms, 1);
+	rc = xss_do_write(NULL, 0, path, value, 0, &perms, 1);
 	if (rc) {
 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
 	} else {
@@ -1067,9 +1540,9 @@ int xss_write_guest_domain_ro(const char *path, const char *value, uint32_t domi
 	 * no need to set additionally read permission.
 	 */
 	if (domid == 0) {
-		rc = xss_do_write(path, value, 0, perms, 1);
+		rc = xss_do_write(NULL, 0, path, value, 0, perms, 1);
 	} else {
-		rc = xss_do_write(path, value, 0, perms, 2);
+		rc = xss_do_write(NULL, 0, path, value, 0, perms, 2);
 	}
 	if (rc) {
 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
@@ -1126,7 +1599,6 @@ int xss_set_perm(const char *path, domid_t domid, enum xs_perm perm)
 	rc = set_perms_by_array(entry, &permissions, 1);
 	if (!rc) {
 		entry->generation = glob_gen_inc_ret();
-		LOG_ERR("%s %d set perm gen = %llu", __func__, __LINE__, entry->generation);
 	}
 
 	k_mutex_unlock(&xsel_mutex);
@@ -1188,7 +1660,7 @@ static void _handle_write(struct xenstore *xenstore, struct xsd_sockmsg *header,
 		goto free_path;
 	}
 
-	rc = xss_do_write(path, data, domain->domid, NULL, 0);
+	rc = xss_do_write(xenstore, header->tx_id, path, data, domain->domid, NULL, 0);
 	if (rc) {
 		LOG_ERR("Failed to write to xenstore (rc=%d)", rc);
 		send_errno(xenstore, header->req_id, rc);
@@ -1377,7 +1849,6 @@ static void handle_set_perms(struct xenstore *xenstore, struct xsd_sockmsg *head
 		return;
 	}
 	entry->generation = glob_gen_inc_ret();
-	LOG_ERR("%s %d set perm gen = %llu", __func__, __LINE__, entry->generation);
 	k_mutex_unlock(&xsel_mutex);
 
 	send_reply(xenstore, header->req_id, XS_SET_PERMS, "OK");
@@ -1410,7 +1881,9 @@ static void handle_read(struct xenstore *xenstore, struct xsd_sockmsg *header, c
 {
 	char *path;
 	struct xs_entry *entry;
+	struct xs_trans_accessed_node *acc_node;
 	int rc;
+	bool is_trans = is_trans_call(xenstore, header->tx_id);
 
 	rc = construct_path(payload, xenstore->domain->domid, &path);
 	if (rc) {
@@ -1420,32 +1893,76 @@ static void handle_read(struct xenstore *xenstore, struct xsd_sockmsg *header, c
 	}
 
 	k_mutex_lock(&xsel_mutex, K_FOREVER);
-	entry = key_to_entry_check_perm(path, xenstore->domain->domid, XS_PERM_READ);
-	k_free(path);
-
-	if (!entry) {
-		k_mutex_unlock(&xsel_mutex);
-		send_errno(xenstore, header->req_id, ENOENT);
-		return;
+	if (is_trans) {
+		acc_node = get_acc_node(xenstore, header->tx_id, path);
+		if (acc_node) {
+			entry = acc_node->trans_entry;
+			if (acc_node->should_delete) {
+				rc = ENOENT;
+				goto err;
+			}
+		} else {
+			entry = key_to_entry_check_perm(path, xenstore->domain->domid, XS_PERM_READ);
+			if (entry) {
+				trans_update_node(xenstore, entry, header->tx_id, XS_TRANS_READ);
+			}
+		}
+	} else {
+		entry = key_to_entry_check_perm(path, xenstore->domain->domid, XS_PERM_READ);
 	}
 
+	if (!entry) {
+		rc = ENOENT;
+		goto err;
+	}
+
+	k_free(path);
 	send_reply_read(xenstore, header->req_id, XS_READ,
 			entry->value ? entry->value : "");
 	k_mutex_unlock(&xsel_mutex);
+	return;
+
+err:
+	k_free(path);
+	k_mutex_unlock(&xsel_mutex);
+	send_errno(xenstore, header->req_id, rc);
 }
 
-static int xss_do_rm(const char *key, uint32_t caller_id)
+static int xss_do_rm(struct xenstore *xenstore, uint32_t tx_id, const char *key)
 {
 	struct xs_entry *entry;
+	uint32_t caller_id;
+	bool is_trans = is_trans_call(xenstore, tx_id);
+	struct xs_trans_accessed_node *acc_node;
+
+	if (!xenstore) {
+		caller_id = 0;
+	} else {
+		caller_id = xenstore->domain->domid;
+	}
 
 	k_mutex_lock(&xsel_mutex, K_FOREVER);
 	entry = key_to_entry_check_perm(key, caller_id, XS_PERM_WRITE);
-	if (!entry) {
-		k_mutex_unlock(&xsel_mutex);
-		return -EINVAL;
+	if (!is_trans) {
+		if (!entry) {
+			k_mutex_unlock(&xsel_mutex);
+			return -EINVAL;
+		}
+
+		trans_update_nodes(xenstore, entry, tx_id);
+		free_node(entry);
+	} else {
+		if (!entry) {
+			acc_node = get_acc_node(xenstore, tx_id, key);
+			if (!acc_node) {
+				k_mutex_unlock(&xsel_mutex);
+				return -EINVAL;
+			}
+			entry = acc_node->trans_entry;
+		}
+		trans_modify_node_with_children(xenstore, entry->full_path, tx_id, XS_TRANS_DELETE);
 	}
 
-	free_node(entry);
 	k_mutex_unlock(&xsel_mutex);
 
 	return 0;
@@ -1453,7 +1970,7 @@ static int xss_do_rm(const char *key, uint32_t caller_id)
 
 int xss_rm(const char *path)
 {
-	int ret = xss_do_rm(path, 0);
+	int ret = xss_do_rm(NULL, 0, path);
 
 	if (!ret) {
 		notify_watchers(path, 0);
@@ -1465,9 +1982,9 @@ int xss_rm(const char *path)
 static void handle_rm(struct xenstore *xenstore, struct xsd_sockmsg *header, char *payload,
 	       uint32_t len)
 {
-	if (xss_do_rm(payload, xenstore->domain->domid)) {
+	if (!xss_do_rm(xenstore, header->tx_id, payload)) {
 		notify_watchers(payload, xenstore->domain->domid);
-		send_reply_read(xenstore, header->req_id, XS_RM, "");
+		send_reply(xenstore, header->req_id, XS_RM, "OK");
 	}
 }
 
@@ -1627,29 +2144,169 @@ static void handle_unwatch(struct xenstore *xenstore, struct xsd_sockmsg *header
 	send_reply(xenstore, header->req_id, XS_UNWATCH, "");
 }
 
+static struct xs_transaction *new_transaction(struct xenstore *xenstore, int *err)
+{
+	struct xs_transaction *trans;
+
+	if (xenstore->domain->domid != 0 &&
+	    xenstore->active_transactions >= quota_max_trans) {
+		if (err) {
+			*err = EBUSY;
+		}
+		return NULL;
+	}
+
+	trans = k_malloc(sizeof(*trans));
+	if (!trans) {
+		if (err) {
+			*err = ENOMEM;
+		}
+		return NULL;
+	}
+
+	trans->failed = false;
+	trans->xenstore = xenstore;
+	trans->generation = glob_gen_inc_ret();
+	trans->tx_id = trans->generation;
+	++xenstore->active_transactions;
+	
+	sys_slist_init(&trans->acc_nodes);
+	*err = 0;
+
+	return trans;
+}
+
 static void handle_transaction_start(struct xenstore *xenstore, struct xsd_sockmsg *header,
 				     char *payload, uint32_t len)
 {
-	char buf[INT32_MAX_STR_LEN] = { 0 };
+	struct xs_transaction *trans;
+	char buf[UINT32_MAX_STR_LEN] = { 0 };
+	int err;
 
-	if (xenstore->running_transaction) {
-		LOG_ERR("domid#%u: transaction already started", xenstore->domain->domid);
-		send_errno(xenstore, header->req_id, EBUSY);
+	trans = new_transaction(xenstore, &err);
+	if (!trans || err) {
+		send_errno(xenstore, header->req_id, err);
 		return;
 	}
 
-	xenstore->running_transaction = ++xenstore->transaction;
-	snprintf(buf, sizeof(buf), "%d", xenstore->running_transaction);
+	sys_slist_append(&xenstore->transactions, &trans->node);
+	snprintf(buf, sizeof(buf), "%u", trans->tx_id);
 	send_reply(xenstore, header->req_id, XS_TRANSACTION_START, buf);
+}
+
+static bool validate_transaction(struct xs_transaction *trans)
+{
+	struct xs_entry *entry;
+	struct xs_trans_accessed_node *iter;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&trans->acc_nodes, iter, node) {
+		entry = key_to_entry(iter->trans_entry->full_path);
+		/* The node does not exist in the real tree, so there are no transaction conflicts */
+		if (iter->should_delete && !entry) {
+			continue;
+		}
+		if (!entry) {
+			return false;
+		}
+		if (entry->generation > iter->trans_entry->generation) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int commit_transaction(struct xs_transaction *trans)
+{
+	struct xs_trans_accessed_node *iter;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&trans->acc_nodes, iter, node) {
+		if (iter->should_delete) {
+			xss_do_rm(trans->xenstore, 0, iter->trans_entry->full_path);
+		} else if (iter->is_modified) {
+			xss_do_write(trans->xenstore, 0, iter->trans_entry->full_path,
+				     iter->trans_entry->value, trans->xenstore->domain->domid,
+				     NULL, 0);
+		}
+	}
+
+	return 0;
+}
+
+static void free_transaction(struct xenstore *xenstore, struct xs_transaction *trans)
+{
+	struct xs_transaction *trans_iter;
+	struct xs_trans_accessed_node *iter, *next;
+	sys_snode_t *prev_node = NULL;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&xenstore->transactions, trans_iter, node) {
+		if (trans_iter == trans) {
+			break;
+		}
+		prev_node = &trans_iter->node;
+	}
+
+	sys_slist_remove(&xenstore->transactions, prev_node, &trans_iter->node);
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&trans->acc_nodes, iter, next, node) {
+		free_node(iter->trans_entry);
+		k_free(iter);
+		sys_slist_remove(&trans->acc_nodes, NULL, &iter->node);
+	}
+
+	k_free(trans);
+}
+
+static void free_all_transactions(struct xenstore *xenstore)
+{
+	struct xs_transaction *iter, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&xenstore->transactions, iter, next, node) {
+		free_transaction(xenstore, iter);
+	}
 }
 
 static void handle_transaction_stop(struct xenstore *xenstore, struct xsd_sockmsg *header,
 				    char *payload, uint32_t len)
 {
-	// TODO check contents, transaction completion, etc
-	xenstore->stop_transaction_id = header->req_id;
-	xenstore->pending_stop_transaction = true;
-	xenstore->running_transaction = 0;
+	bool abort_trans;
+	struct xs_transaction *trans;
+
+	LOG_ERR("len = %u %s", len, payload);
+
+	if (len != 2) {
+		send_errno(xenstore, header->req_id, EINVAL);
+		return;
+	}
+
+	if (payload[0] == 'T') {
+		abort_trans = false;
+	} else if (payload[0] == 'F') {
+		abort_trans = true;
+	} else {
+		send_errno(xenstore, header->req_id, EINVAL);
+		return;
+	}
+
+	trans = find_transaction(xenstore, header->tx_id);
+	if (!trans) {
+		send_errno(xenstore, header->req_id, EINVAL);
+		return;
+	}
+
+	if (!abort_trans) {
+		if (!validate_transaction(trans)) {
+			send_errno(xenstore, header->req_id, EAGAIN);
+		} else if (commit_transaction(trans)) {
+			send_errno(xenstore, header->req_id, EAGAIN);
+		} else {
+			xenstore->active_transactions--;
+			send_reply(xenstore, header->req_id, header->type, "OK");
+		}
+	}
+	//Free transaction
+	free_transaction(xenstore, trans);
+	xenstore->active_transactions--;
 }
 
 static void handle_get_domain_path(struct xenstore *xenstore, struct xsd_sockmsg *header,
@@ -1851,23 +2508,10 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
 	struct xen_domain *domain = p1;
 	struct xenstore *xenstore = &domain->xenstore;
 
-	xenstore->transaction = 0;
-	xenstore->running_transaction = 0;
-	xenstore->stop_transaction_id = 0;
-	xenstore->pending_stop_transaction = false;
+	xenstore->active_transactions = 0;
 
 	while (!atomic_get(&xenstore->thrd_stop)) {
-		if (xenstore->pending_stop_transaction) {
-			send_reply(xenstore,
-				   xenstore->stop_transaction_id,
-				   XS_TRANSACTION_END, "");
-			xenstore->stop_transaction_id = 0;
-			xenstore->pending_stop_transaction = false;
-		}
-
-		if (!xenstore->running_transaction) {
-			process_pending_watch_events(domain);
-		}
+		process_pending_watch_events(domain);
 
 		if (!can_read(xenstore) && !can_write(xenstore)) {
 			k_sem_take(&xenstore->xb_sem, K_FOREVER);
@@ -1884,6 +2528,55 @@ static void xenstore_evt_thrd(void *p1, void *p2, void *p3)
 
 	/* Need to cleanup all watches and events before destroying */
 	cleanup_domain_watches(domain);
+}
+
+static char *print_perms(struct xs_entry *entry)
+{
+	size_t total_size, i = 0;
+	char *perm_str = serialize_perms(entry, &total_size);
+
+	for (i = 0; i < total_size - 1; i++) {
+		if (!perm_str[i]) {
+			perm_str[i] = ',';
+		}
+	}
+
+	return perm_str;
+}
+
+static void print_xenstore(sys_dlist_t *chlds, int iter)
+{
+	struct xs_entry *entry;
+	char shift_buf[50] = { 0 };
+	char *perm_str;
+
+	if (!iter) {
+		LOG_ERR("+");
+	}
+	shift_buf[0] = '|';
+
+	if (sys_dlist_is_empty(chlds)) {
+		shift_buf[0] = '+';
+		for (int i = 1; i < iter + 1; i++) {
+			shift_buf[i] = '-';
+		}
+		LOG_ERR("%s", shift_buf);
+		return;
+	}
+
+	for (int i = 1; i < iter + 1; i++) {
+		shift_buf[i] = '>';
+	}
+
+	SYS_DLIST_FOR_EACH_CONTAINER(chlds, entry, node) {
+		if (entry->key) {
+			perm_str = print_perms(entry);
+			LOG_ERR("%s%s (%s) entry = [%p] node = [%p]", shift_buf, entry->key, perm_str, entry, &entry->node);
+			k_free(perm_str);
+		}
+
+		print_xenstore(&entry->child_list, iter + 1);
+	}
 }
 
 int start_domain_stored(struct xen_domain *domain)
@@ -1943,8 +2636,12 @@ int start_domain_stored(struct xen_domain *domain)
 			domain, NULL, NULL, 7, 0, K_NO_WAIT);
 
 	k_mutex_lock(&xenstore_list_mutex, K_FOREVER);
+	LOG_ERR("ADD XENSTORE TO LIST [%p] domid = %u", xenstore, xenstore->domain->domid);
 	sys_slist_append(&xenstores_list, &xenstore->node);
 	k_mutex_unlock(&xenstore_list_mutex);
+
+	LOG_ERR("START XENSTORE");
+	print_xenstore(&root_xenstore.child_list, 0);
 
 	return 0;
 
@@ -1982,6 +2679,8 @@ static void remove_ref_entries_recursive(uint32_t domid, sys_dlist_t *chlds)
 	struct xs_entry *entry, *next;
 	struct xs_permissions *perms, *iter_perm, *next_perm;
 	sys_snode_t *prev_node;
+
+	print_xenstore(&root_xenstore.child_list, 0);
 
 	SYS_DLIST_FOR_EACH_CONTAINER_SAFE(chlds, entry, next, node) {
 		perms = SYS_SLIST_PEEK_HEAD_CONTAINER(&entry->perms, perms, node);
@@ -2065,6 +2764,7 @@ int stop_domain_stored(struct xen_domain *domain)
 	}
 
 	free_buffered_data(xenstore);
+	free_all_transactions(xenstore);
 	remove_ref_entries(domain->domid);
 	remove_xenstore_from_list(xenstore);
 

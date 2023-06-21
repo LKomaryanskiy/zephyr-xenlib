@@ -35,10 +35,8 @@ struct xenstore {
 	evtchn_port_t remote_evtchn;
 	evtchn_port_t local_evtchn;
 	size_t xs_stack_slot;
-	int transaction;
-	int running_transaction;
-	int stop_transaction_id;
-	bool pending_stop_transaction;
+	size_t active_transactions;
+	sys_slist_t transactions;
 };
 
 int start_domain_stored(struct xen_domain *domain);
