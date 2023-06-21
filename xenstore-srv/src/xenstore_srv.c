@@ -84,12 +84,14 @@ BUILD_ASSERT(sizeof(used_threads) * CHAR_BIT >= CONFIG_DOM_MAX);
 static K_MUTEX_DEFINE(xsel_mutex);
 static K_MUTEX_DEFINE(pfl_mutex);
 static K_MUTEX_DEFINE(wel_mutex);
+static K_MUTEX_DEFINE(xenstore_list_mutex);
 
 static sys_dlist_t watch_entry_list = SYS_DLIST_STATIC_INIT(&watch_entry_list);
 static sys_dlist_t pending_watch_event_list =
 		   SYS_DLIST_STATIC_INIT(&pending_watch_event_list);
 
 static struct xs_entry root_xenstore;
+static sys_slist_t xenstores_list;
 
 struct message_handle {
 	void (*h)(struct xenstore *xenstore,
@@ -1940,6 +1942,10 @@ int start_domain_stored(struct xen_domain *domain)
 			xenstore_evt_thrd,
 			domain, NULL, NULL, 7, 0, K_NO_WAIT);
 
+	k_mutex_lock(&xenstore_list_mutex, K_FOREVER);
+	sys_slist_append(&xenstores_list, &xenstore->node);
+	k_mutex_unlock(&xenstore_list_mutex);
+
 	return 0;
 
 unmap_ring:
@@ -2010,6 +2016,22 @@ static void remove_ref_entries(uint32_t domid)
 	k_mutex_unlock(&xsel_mutex);
 }
 
+static void remove_xenstore_from_list(struct xenstore *xenstore)
+{
+	struct xenstore *iter;
+	sys_snode_t *prev_node = NULL;
+
+	k_mutex_lock(&xenstore_list_mutex, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&xenstores_list, iter, node) {
+		if (iter == xenstore) {
+			sys_slist_remove(&xenstores_list, prev_node, &iter->node);
+			break;
+		}
+		prev_node = &iter->node;
+	}
+	k_mutex_unlock(&xenstore_list_mutex);
+}
+
 int stop_domain_stored(struct xen_domain *domain)
 {
 	int rc = 0, err = 0;
@@ -2044,6 +2066,7 @@ int stop_domain_stored(struct xen_domain *domain)
 
 	free_buffered_data(xenstore);
 	remove_ref_entries(domain->domid);
+	remove_xenstore_from_list(xenstore);
 
 	return err;
 }
@@ -2052,6 +2075,7 @@ static int xs_init_root(const struct device *d)
 {
 	ARG_UNUSED(d);
 
+	sys_slist_init(&xenstores_list);
 	sys_dlist_init(&root_xenstore.child_list);
 	sys_dnode_init(&root_xenstore.node);
 

@@ -21,6 +21,8 @@ struct buffered_data {
 };
 
 struct xenstore {
+	/* Used to link xenstores to the list */
+	sys_snode_t node;
 	sys_slist_t out_list;
 	struct buffered_data *in;
 	/* Count the number of used out buffers to prevent Denial of Service attacks */
